@@ -24,6 +24,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 import java.util.function.Supplier;
@@ -45,6 +46,7 @@ import org.apache.lucene.document.StringField;
 import org.apache.lucene.index.BinaryDocValues;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.DocValuesSkipper;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.IndexWriter;
 import org.apache.lucene.index.IndexWriterConfig;
@@ -64,6 +66,10 @@ import org.apache.lucene.index.TermsEnum.SeekStatus;
 import org.apache.lucene.store.ByteBuffersDataInput;
 import org.apache.lucene.store.ByteBuffersDataOutput;
 import org.apache.lucene.store.Directory;
+import org.apache.lucene.store.FilterDirectory;
+import org.apache.lucene.store.FilterIndexInput;
+import org.apache.lucene.store.IOContext;
+import org.apache.lucene.store.IndexInput;
 import org.apache.lucene.tests.analysis.MockAnalyzer;
 import org.apache.lucene.tests.codecs.asserting.AssertingCodec;
 import org.apache.lucene.tests.index.BaseCompressingDocValuesFormatTestCase;
@@ -1019,5 +1025,91 @@ public class TestLucene90DocValuesFormat extends BaseCompressingDocValuesFormatT
     assertNull(termsEnum.next());
     reader.close();
     directory.close();
+  }
+
+  public void testDocValuesSkipperPrefetchesData() throws IOException {
+    AtomicInteger prefetchCount = new AtomicInteger();
+    long documentCount = atLeast(10000);
+
+    Directory dir = newDirectory();
+    IndexWriterConfig config =
+        newIndexWriterConfig()
+            .setCodec(TestUtil.alwaysDocValuesFormat(new Lucene90DocValuesFormat()));
+    try (IndexWriter writer = new IndexWriter(dir, config)) {
+      for (int i = 0; i < documentCount; i++) {
+        Document doc = new Document();
+        doc.add(NumericDocValuesField.indexedField("dv", i));
+        writer.addDocument(doc);
+      }
+      writer.forceMerge(1);
+    }
+
+    Directory readDir =
+        new FilterDirectory(dir) {
+          @Override
+          public IndexInput openInput(String name, IOContext context) throws IOException {
+            return new PrefetchTrackingIndexInput(super.openInput(name, context), prefetchCount);
+          }
+        };
+
+    try (DirectoryReader reader = DirectoryReader.open(readDir)) {
+      assertEquals(1, reader.leaves().size());
+      LeafReader leafReader = reader.leaves().get(0).reader();
+
+      assertEquals(0L, prefetchCount.get());
+
+      // triggers no prefetch() on the data file
+      DocValuesSkipper skipper = leafReader.getDocValuesSkipper("dv");
+      assertEquals(0, prefetchCount.get());
+
+      // access metadata, no prefetching
+      assertEquals(0, skipper.minValue());
+      assertEquals(documentCount - 1, skipper.maxValue());
+      assertEquals(documentCount, skipper.docCount());
+
+      // no other prefetching happened when accessing metadata
+      assertEquals(0, prefetchCount.get());
+
+      // calling advance prefetches
+      skipper.advance(1000);
+      assertTrue(
+          "Expected at least one prefetch on the skipper data slice, but got "
+              + prefetchCount.get(),
+          prefetchCount.get() > 0);
+    }
+    dir.close();
+  }
+
+  private static class PrefetchTrackingIndexInput extends FilterIndexInput {
+    private final AtomicInteger prefetchCount;
+
+    PrefetchTrackingIndexInput(IndexInput in, AtomicInteger prefetchCount) {
+      super(in.toString(), in);
+      this.prefetchCount = prefetchCount;
+    }
+
+    @Override
+    public void prefetch(long offset, long length) throws IOException {
+      prefetchCount.incrementAndGet();
+      in.prefetch(offset, length);
+    }
+
+    @Override
+    public IndexInput slice(String sliceDescription, long offset, long length) throws IOException {
+      return new PrefetchTrackingIndexInput(
+          in.slice(sliceDescription, offset, length), prefetchCount);
+    }
+
+    @Override
+    public IndexInput slice(String sliceDescription, long offset, long length, IOContext context)
+        throws IOException {
+      return new PrefetchTrackingIndexInput(
+          in.slice(sliceDescription, offset, length, context), prefetchCount);
+    }
+
+    @Override
+    public IndexInput clone() {
+      return new PrefetchTrackingIndexInput(in.clone(), prefetchCount);
+    }
   }
 }
