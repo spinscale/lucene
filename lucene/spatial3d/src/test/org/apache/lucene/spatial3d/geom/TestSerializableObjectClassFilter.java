@@ -22,12 +22,13 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.lucene.tests.util.LuceneTestCase;
 
 public class TestSerializableObjectClassFilter extends LuceneTestCase {
 
-  static volatile boolean nonSerializableConstructed = false,
-      nonSerializableClassInitialized = false;
+  static final AtomicBoolean nonSerializableConstructed = new AtomicBoolean(false),
+      nonSerializableClassInitialized = new AtomicBoolean(false);
 
   /** A SerializableObject that is not registered in {@link StandardObjects}. */
   public static class CustomShape implements SerializableObject {
@@ -50,11 +51,11 @@ public class TestSerializableObjectClassFilter extends LuceneTestCase {
   /** Not a SerializableObject, but instantiable from an InputStream. */
   public static class NotASerializableObject {
     static {
-      nonSerializableClassInitialized = true;
+      nonSerializableClassInitialized.set(true);
     }
 
     public NotASerializableObject(InputStream inputStream) {
-      nonSerializableConstructed = true;
+      nonSerializableConstructed.set(true);
     }
   }
 
@@ -76,7 +77,7 @@ public class TestSerializableObjectClassFilter extends LuceneTestCase {
     var e = expectThrows(IOException.class, () -> SerializableObject.readObject(in));
     assertTrue(e.getCause() instanceof ClassCastException);
     assertTrue(e.getMessage().contains(NotASerializableObject.class.getName()));
-    assertFalse(nonSerializableClassInitialized);
-    assertFalse(nonSerializableConstructed);
+    assertFalse(nonSerializableClassInitialized.get());
+    assertFalse(nonSerializableConstructed.get());
   }
 }
